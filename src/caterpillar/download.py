@@ -29,17 +29,22 @@ monkeypatch_get_terminal_size()
 
 
 # Similar behavior to https://github.com/ytdl-org/youtube-dl/blob/3e4cedf9e8cd3157df2457df7274d0c842421945/youtube_dl/YoutubeDL.py#L230
-__PROGRESS_STATUS_DEFAULTS = {k:None for k in """
+__PROGRESS_STATUS_DEFAULTS = {
+    k: None
+    for k in """
     status   downloaded_bytes   total_bytes total_bytes_estimate
     fragment_index fragment_count
-""".split()} #filename tmpfilename elapsed eta speed
-__STATUS_DOWNLOADING = 'downloading'
-__STATUS_ERROR       = 'error'
-__STATUS_FINISHED    = 'finished'
+""".split()
+}  # filename tmpfilename elapsed eta speed
+__STATUS_DOWNLOADING = "downloading"
+__STATUS_ERROR = "error"
+__STATUS_FINISHED = "finished"
+
+
 def call_progress_hooks(progress_hooks: List[Callable], **kwargs):
     status = __PROGRESS_STATUS_DEFAULTS.copy()
     status.update(kwargs)
-    for f in (progress_hooks or []):
+    for f in progress_hooks or []:
         f(status)
 
 
@@ -112,7 +117,9 @@ def resumable_download_with_retries(
 
     retries = 0
     while True:
-        success, size = resumable_download(url, incomplete_file, server_timestamp=server_timestamp)
+        success, size = resumable_download(
+            url, incomplete_file, server_timestamp=server_timestamp
+        )
         if success:
             os.replace(incomplete_file, file)
             return True, size
@@ -167,13 +174,12 @@ def _raise_keyboard_interrupt(signum, _):
     raise KeyboardInterrupt
 
 
-#def get_downloaded_bytes(folder: Path):
+# def get_downloaded_bytes(folder: Path):
 #    return sum(f.stat().st_size for f in folder.glob('**/*') if f.is_file())
 
+
 def download_m3u8_playlist_or_variant(
-    m3u8_url: str,
-    remote0_m3u8_file: Path,
-    remote1_m3u8_file: Path = None,
+    m3u8_url: str, remote0_m3u8_file: Path, remote1_m3u8_file: Path = None,
 ) -> Tuple[bool, str, str]:
     if not download_m3u8_file(m3u8_url, remote0_m3u8_file):
         # Return without retries because we already retried a
@@ -275,22 +281,24 @@ def download_m3u8_segments(
                         num_success += 1
                     else:
                         num_failure += 1
-                    downloaded += size #get_downloaded_bytes(working_directory)
-                    call_progress_hooks(progress_hooks,
-                        status               = __STATUS_DOWNLOADING,
-                        fragment_index       = num_handled,
-                        fragment_count       = total,
-                        downloaded_bytes     = downloaded,
-                        total_bytes_estimate = ceil(downloaded / num_handled * total)
+                    downloaded += size  # get_downloaded_bytes(working_directory)
+                    call_progress_hooks(
+                        progress_hooks,
+                        status=__STATUS_DOWNLOADING,
+                        fragment_index=num_handled,
+                        fragment_count=total,
+                        downloaded_bytes=downloaded,
+                        total_bytes_estimate=ceil(downloaded / num_handled * total),
                     )
                     logger.debug(f"progress: {num_success}/{num_failure}/{total}")
                     bar.update(1)
-            call_progress_hooks(progress_hooks,
-                status               = __STATUS_FINISHED,
-                fragment_index       = num_handled,
-                fragment_count       = total,
-                downloaded_bytes     = downloaded,
-                total_bytes          = downloaded
+            call_progress_hooks(
+                progress_hooks,
+                status=__STATUS_FINISHED,
+                fragment_index=num_handled,
+                fragment_count=total,
+                downloaded_bytes=downloaded,
+                total_bytes=downloaded,
             )
 
             if num_failure > 0:

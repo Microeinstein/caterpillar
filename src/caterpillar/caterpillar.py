@@ -307,7 +307,7 @@ def process_entry(
         return 1
 
     if not output.suffix:
-        logger.critical(f"output must have a suffix, e.g., .mp4")
+        logger.critical("output must have a suffix, e.g., .mp4")
         return 1
 
     if output.exists() and not force:
@@ -350,11 +350,7 @@ def process_entry(
         return 1
 
     working_directory = prepare_working_directory(
-        m3u8_url,
-        output,
-        workroot=workroot,
-        user_specified_workdir=workdir,
-        wipe=wipe,
+        m3u8_url, output, workroot=workroot, user_specified_workdir=workdir, wipe=wipe,
     )
     if not working_directory:
         logger.critical("failed to prepare working directory")
@@ -364,7 +360,11 @@ def process_entry(
     local_m3u8_file = working_directory / "local.m3u8"
     for ntry in range(max(retries, 0) + 1):
         try:
-            success, m3u8_url, remote_m3u8_file = download.download_m3u8_playlist_or_variant(
+            (
+                success,
+                m3u8_url,
+                remote_m3u8_file,
+            ) = download.download_m3u8_playlist_or_variant(
                 m3u8_url, remote0_m3u8_file, remote1_m3u8_file
             )
             if not success:
@@ -381,9 +381,10 @@ def process_entry(
                 raise RuntimeError("failed to download some segments")
 
             merge.incremental_merge(
-                local_m3u8_file, merge_dest,
+                local_m3u8_file,
+                merge_dest,
                 concat_method=concat_method,
-                loglevel=ffmpeg_loglevel
+                loglevel=ffmpeg_loglevel,
             )
 
             if output != merge_dest:
@@ -496,57 +497,87 @@ def process_batch(
 
 
 DEFAULT_ARGUMENTS: Dict = None
+
+
 def make_arguments() -> ArgumentParser:
     parser = ArgumentParser()
     add = parser.add_argument
 
     add("m3u8_url", help="the VOD URL, or the batch mode manifest file")
-    add("output", type=Path,
+    add(
+        "output",
         nargs="?",
+        type=Path,
         default=None,
         help="""path to the final output file (default is a .ts file in the
         current directory with the basename of the VOD URL)""",
     )
-    add("--batch", "-b", action="store_true",
+    add(
+        "-b",
+        "--batch",
+        action="store_true",
         help='run in batch mode (see the "Batch Mode" section in docs)',
     )
-    add("--exist-ok", "-e", action="store_true",
+    add(
+        "-e",
+        "--exist-ok",
+        action="store_true",
         help="skip existing targets (only works in batch mode)",
     )
-    add("--force", "-f", action="store_true",
+    add(
+        "-f",
+        "--force",
+        action="store_true",
         help="overwrite the output file if it already exists",
     )
-    add("--jobs", "-j", type=int,
+    add(
+        "-j",
+        "--jobs",
+        type=int,
         default=None,
         help="""maximum number of concurrent downloads (default is twice
         the number of CPU cores, including virtual cores)""",
     )
-    add("--retries", "-r", type=int,
+    add(
+        "-r",
+        "--retries",
+        type=int,
         default=2,
         help="""number of times to retry when a possibly recoverable
         error (e.g. download issue) occurs; default is 2, and 0 turns
         off retries""",
     )
-    add("--keep", "-k", action="store_true",
+    add(
+        "-k",
+        "--keep",
+        action="store_true",
         help="keep intermediate files even after a successful merge",
     )
-    add("--concat-method", "-m", choices=["concat_demuxer", "concat_protocol", "0", "1"],
+    add(
+        "-m",
+        "--concat-method",
+        choices=["concat_demuxer", "concat_protocol", "0", "1"],
         default="concat_demuxer",
         help="""method for concatenating intermediate files (default is
         'concat_demuxer'); see
         https://github.com/zmwangx/caterpillar/#notes-and-limitations
         for details""",
     )
-    add("--remove-manifest-on-success", action="store_true",
+    add(
+        "--remove-manifest-on-success",
+        action="store_true",
         help="""remove manifest file if all downloads are successful
         (only works in batch mode)""",
     )
-    add("--workdir", type=Path,
+    add(
+        "--workdir",
+        type=Path,
         help="""working directory to store downloaded segments and other
         intermediate files (default is automatically determined based on
         URL and output file)""",
     )
-    add("--workroot",
+    add(
+        "--workroot",
         help="""if nonempty, this path is used as the root directory for
         all processing, under which both the working directory and final
         destination are mapped; after merging is done, the artifact is
@@ -554,43 +585,57 @@ def make_arguments() -> ArgumentParser:
         a slow HDD with workroot on a fast SSD; destination on a
         networked drive with workroot on a local drive)""",
     )
-    add("--wipe", action="store_true",
+    add(
+        "--wipe",
+        action="store_true",
         help="wipe all downloaded files (if any) and start over",
     )
-    add("--progress", action="store_true",
+    add(
+        "--progress",
+        action="store_true",
         help="show download progress bar regardless of verbosity level",
     )
-    add("--no-progress", action="store_true",
+    add(
+        "--no-progress",
+        action="store_true",
         help="suppress download progress bar regardless of verbosity level",
     )
-    add("--verbose", "-v", action="count",
+    add(
+        "-v",
+        "--verbose",
+        action="count",
         default=0,
         help="increase logging verbosity (can be specified multiple times)",
     )
-    add("--quiet", "-q", action="count",
+    add(
+        "-q",
+        "--quiet",
+        action="count",
         default=0,
         help="decrease logging verbosity (can be specified multiple times)",
     )
-    add("--ffmpeg-loglevel",
-        default="info",
-        help="set logging level for ffmpeg",
+    add(
+        "--ffmpeg-loglevel", default="info", help="set logging level for ffmpeg",
     )
-    add("--debug", action="store_true",
+    add(
+        "--debug",
+        action="store_true",
         help="output debugging information (also implies highest verbosity)",
     )
     add("-V", "--version", action="version", version=__version__)
 
-    exclude_defaults = ('help', 'version')
+    exclude_defaults = ("help", "version")
     global DEFAULT_ARGUMENTS
     DEFAULT_ARGUMENTS = {
         a.dest: a.default
         for a in parser._actions
         if a.dest not in exclude_defaults
-            and len(a.option_strings) > 0
-            or a.default is not None
+        and len(a.option_strings) > 0
+        or a.default is not None
     }
 
     return parser
+
 
 def __handle_arguments(args: argparse.Namespace) -> Any:
     vrb = args.verbose - args.quiet
@@ -649,6 +694,8 @@ def __handle_arguments(args: argparse.Namespace) -> Any:
         progress_hooks=args.progress_hooks,
     )
     return kwargs
+
+
 def __launch(args: argparse.Namespace) -> int:
     ret = __handle_arguments(args)
     if not isinstance(ret, dict):
@@ -668,6 +715,7 @@ def __launch(args: argparse.Namespace) -> int:
             debug=args.debug,
             **ret,
         )
+
 
 def invoke(**kwargs):
     """Available arguments:
@@ -696,6 +744,7 @@ def invoke(**kwargs):
     args.update(kwargs)
     if __launch(argparse.Namespace(**args)) != 0:
         raise RuntimeError()
+
 
 def main() -> int:
     parser = make_arguments()
