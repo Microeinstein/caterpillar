@@ -206,7 +206,7 @@ The syntax of the configuration file is documented in the template (automaticall
 
 ## Notes and limitations
 
-- [`EXT-X-STREAM-INF` (and `EXT-X-I-FRAME-STREAM-INF` by extension)](https://tools.ietf.org/html/rfc8216#section-4.3.4.2), despite being part of protocol version 1, is not supported due to complexity and inherent conflict with caterpillar's working model (only one rendition is allowed). One has to preprocess a stream with `EXT-X-STREAM-INF` and pick out the variant stream to be used with caterpillar.
+- [`EXT-X-STREAM-INF` (and `EXT-X-I-FRAME-STREAM-INF` by extension)](https://tools.ietf.org/html/rfc8216#section-4.3.4.2), despite being part of protocol version 1, it is only supported to a limited extent due to complexity and inherent conflict with caterpillar's working model (only one rendition is allowed). Currently only the choice of the first variant stream is implemented. To use a different variant, one has to preprocess a stream with `EXT-X-STREAM-INF` and pick out the one to be used with caterpillar.
 
   Efforts could be made to extract the variant streams and show them to the user, and it is even feasible to proceed with the download if only one variant stream is present. Contribution is welcome for this feature.
 
