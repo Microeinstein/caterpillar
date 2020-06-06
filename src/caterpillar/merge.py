@@ -29,7 +29,10 @@ from .utils import abspath, chdir, generate_m3u8, logger, should_log_info
 # Returns None if the merge succeeds, or the basename of the first bad
 # segment if non-monotonous DTS is detected.
 def attempt_merge(
-    m3u8_file: pathlib.Path, output: pathlib.Path, ignore_errors: bool = False
+    m3u8_file: pathlib.Path,
+    output: pathlib.Path,
+    ignore_errors: bool = False,
+    loglevel: str = "info",
 ) -> Optional[str]:
     logger.info(f"attempting to merge {m3u8_file} into {output}")
 
@@ -48,7 +51,7 @@ def attempt_merge(
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
-        "info",
+        loglevel,
         "-f",
         "hls",
         "-i",
@@ -165,7 +168,10 @@ def split_m3u8(
 # [1] https://ffmpeg.org/ffmpeg-all.html#concat-1
 # [2] https://ffmpeg.org/ffmpeg-all.html#concat-2
 def incremental_merge(
-    m3u8_file: pathlib.Path, output: pathlib.Path, concat_method: str = "concat_demuxer"
+    m3u8_file: pathlib.Path,
+    output: pathlib.Path,
+    concat_method: str = "concat_demuxer",
+    loglevel: str = "info",
 ):
     # Resolve output so that we don't write to a different relative path
     # later when we run FFmpeg from a different pwd.
@@ -180,13 +186,13 @@ def incremental_merge(
 
     while True:
         merge_dest = intermediate_dir / f"{playlist_index}.mp4"
-        split_point = attempt_merge(playlist, merge_dest)
+        split_point = attempt_merge(playlist, merge_dest, loglevel=loglevel)
         if not split_point:
             break
         playlist_index += 1
         next_playlist = directory / f"{playlist_index}.m3u8"
         split_m3u8(playlist, (playlist, next_playlist), split_point)
-        attempt_merge(playlist, merge_dest, ignore_errors=True)
+        attempt_merge(playlist, merge_dest, ignore_errors=True, verbosity=verbosity)
         playlist = next_playlist
 
     with chdir(intermediate_dir):
@@ -199,7 +205,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                "info",
+                loglevel,
                 "-f",
                 "concat",
                 "-i",
@@ -221,7 +227,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                "info",
+                loglevel,
                 "-i",
                 ffmpeg_input,
                 "-c",

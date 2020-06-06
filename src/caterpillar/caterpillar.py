@@ -3,12 +3,12 @@
 import argparse
 import datetime
 import os
-import pathlib
 import shutil
 import sys
 import time
 import urllib.parse
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, List, Dict, Optional, Callable
 
 import peewee
 
@@ -24,7 +24,7 @@ from .utils import (
 from .version import __version__
 
 
-USER_CONFIG_FILE = pathlib.Path(USER_CONFIG_DIR).joinpath("caterpillar.conf")
+USER_CONFIG_FILE = Path(USER_CONFIG_DIR).joinpath("caterpillar.conf")
 
 
 ADDITIONAL_HELP_TEXT = f"""
@@ -149,12 +149,12 @@ def load_user_config() -> List[str]:
 @persistence.atomic
 def prepare_working_directory(
     m3u8_url: str,
-    output_file: pathlib.Path,
+    output_file: Path,
     *,
-    workroot: pathlib.Path = None,
-    user_specified_workdir: pathlib.Path = None,
+    workroot: Path = None,
+    user_specified_workdir: Path = None,
     wipe: bool = False,
-) -> Optional[pathlib.Path]:
+) -> Optional[Path]:
     if user_specified_workdir:
         workdir = user_specified_workdir
         if workroot:
@@ -217,7 +217,7 @@ def prepare_working_directory(
 # workroot; e.g., C: mapped under C:\Users\caterpillar\AppData\Local\Temp
 # becomes C:\Users\caterpillar\AppData\Local\Temp\C\. UNC shares
 # \\host\share are mapped to host\share.
-def map_path(path: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+def map_path(path: Path, root: Path) -> Path:
     path = path.resolve()
     drive = path.drive
     if not drive:
@@ -242,7 +242,7 @@ def map_path(path: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
     return mapped_dir.joinpath(name)
 
 
-def rmdir_p(path: pathlib.Path, *, root: pathlib.Path = None) -> None:
+def rmdir_p(path: Path, *, root: Path = None) -> None:
     path = path.resolve()
     if root:
         root = root.resolve()
@@ -255,7 +255,7 @@ def rmdir_p(path: pathlib.Path, *, root: pathlib.Path = None) -> None:
 
 
 # Returns the backup path.
-def move_to_backup(path: pathlib.Path) -> Optional[pathlib.Path]:
+def move_to_backup(path: Path) -> Optional[Path]:
     directory = path.parent
     filename = path.name
     backup = directory / f"{filename}.bak"
@@ -278,25 +278,28 @@ def move_to_backup(path: pathlib.Path) -> Optional[pathlib.Path]:
 
 def process_entry(
     m3u8_url: str,
-    output: pathlib.Path,
+    output: Path,
     *,
     force: bool = False,
     exist_ok: bool = False,
-    workdir: pathlib.Path = None,
-    workroot: pathlib.Path = None,
+    workdir: Path = None,
+    workroot: Path = None,
     wipe: bool = False,
     keep: bool = False,
     jobs: int = None,
     concat_method: str = "concat_demuxer",
     retries: int = 0,
     progress: bool = True,
+    verbosity: int = 0,
+    ffmpeg_loglevel: str = None,
+    progress_hooks: List[Callable] = None,
 ) -> int:
     if output is None:
-        stem = pathlib.Path(urllib.parse.urlsplit(m3u8_url).path).stem
+        stem = Path(urllib.parse.urlsplit(m3u8_url).path).stem
         if not stem or stem.startswith("."):
             logger.critical(f"cannot auto-determine an output file from {m3u8_url}")
             return 1
-        output = pathlib.Path(f"{stem}.mp4")
+        output = Path(f"{stem}.mp4")
         logger.info(f'output not specified; using "{output}"')
 
     if not output.parent.exists():
@@ -346,9 +349,8 @@ def process_entry(
         logger.critical(f'"{output}" is not a valid path or is not writable')
         return 1
 
-    remote_m3u8_url = m3u8_url
     working_directory = prepare_working_directory(
-        remote_m3u8_url,
+        m3u8_url,
         output,
         workroot=workroot,
         user_specified_workdir=workdir,
@@ -357,27 +359,33 @@ def process_entry(
     if not working_directory:
         logger.critical("failed to prepare working directory")
         return 1
-    remote_m3u8_file = working_directory / "remote.m3u8"
+    remote0_m3u8_file = working_directory / "remote0.m3u8"
+    remote1_m3u8_file = working_directory / "remote1.m3u8"
     local_m3u8_file = working_directory / "local.m3u8"
     for ntry in range(max(retries, 0) + 1):
         try:
-            if not download.download_m3u8_file(remote_m3u8_url, remote_m3u8_file):
-                # Return without retries because we already retried a
-                # couple of times in download_m3u8_file.
-                logger.critical(f"failed to download {remote_m3u8_url}")
+            success, m3u8_url, remote_m3u8_file = download.download_m3u8_playlist_or_variant(
+                m3u8_url, remote0_m3u8_file, remote1_m3u8_file
+            )
+            if not success:
                 return 1
-            logger.info(f"downloaded {remote_m3u8_file}")
+
             if not download.download_m3u8_segments(
-                remote_m3u8_url,
+                m3u8_url,
                 remote_m3u8_file,
                 local_m3u8_file,
                 jobs=jobs,
                 progress=progress,
+                progress_hooks=progress_hooks,
             ):
                 raise RuntimeError("failed to download some segments")
+
             merge.incremental_merge(
-                local_m3u8_file, merge_dest, concat_method=concat_method
+                local_m3u8_file, merge_dest,
+                concat_method=concat_method,
+                loglevel=ffmpeg_loglevel
             )
+
             if output != merge_dest:
                 try:
                     logger.info(f'moving "{merge_dest}" to "{output}"...')
@@ -406,7 +414,7 @@ def process_entry(
 
             if not keep:
                 try:
-                    persistence.drop(remote_m3u8_url)
+                    persistence.drop(m3u8_url)
                 except peewee.PeeweeException:
                     logger.exc_error("exception when updating cache")
                 shutil.rmtree(working_directory)
@@ -425,7 +433,7 @@ def process_entry(
 
 
 def process_batch(
-    manifest: pathlib.Path,
+    manifest: Path,
     remove_manifest_on_success: bool = False,
     debug: bool = False,
     **processing_kwargs: Any,
@@ -487,86 +495,58 @@ def process_batch(
     return retval
 
 
-def main() -> int:
-    user_config_options = [] if USER_CONFIG_DISABLED else load_user_config()
-
+DEFAULT_ARGUMENTS: Dict = None
+def make_arguments() -> ArgumentParser:
     parser = ArgumentParser()
     add = parser.add_argument
+
     add("m3u8_url", help="the VOD URL, or the batch mode manifest file")
-    add(
-        "output",
+    add("output", type=Path,
         nargs="?",
-        type=pathlib.Path,
         default=None,
         help="""path to the final output file (default is a .ts file in the
         current directory with the basename of the VOD URL)""",
     )
-    add(
-        "-b",
-        "--batch",
-        action="store_true",
+    add("--batch", "-b", action="store_true",
         help='run in batch mode (see the "Batch Mode" section in docs)',
     )
-    add(
-        "-e",
-        "--exist-ok",
-        action="store_true",
+    add("--exist-ok", "-e", action="store_true",
         help="skip existing targets (only works in batch mode)",
     )
-    add(
-        "-f",
-        "--force",
-        action="store_true",
+    add("--force", "-f", action="store_true",
         help="overwrite the output file if it already exists",
     )
-    add(
-        "-j",
-        "--jobs",
-        type=int,
+    add("--jobs", "-j", type=int,
         default=None,
         help="""maximum number of concurrent downloads (default is twice
         the number of CPU cores, including virtual cores)""",
     )
-    add(
-        "-k",
-        "--keep",
-        action="store_true",
+    add("--retries", "-r", type=int,
+        default=2,
+        help="""number of times to retry when a possibly recoverable
+        error (e.g. download issue) occurs; default is 2, and 0 turns
+        off retries""",
+    )
+    add("--keep", "-k", action="store_true",
         help="keep intermediate files even after a successful merge",
     )
-    add(
-        "-m",
-        "--concat-method",
-        choices=["concat_demuxer", "concat_protocol", "0", "1"],
+    add("--concat-method", "-m", choices=["concat_demuxer", "concat_protocol", "0", "1"],
         default="concat_demuxer",
         help="""method for concatenating intermediate files (default is
         'concat_demuxer'); see
         https://github.com/zmwangx/caterpillar/#notes-and-limitations
         for details""",
     )
-    add(
-        "-r",
-        "--retries",
-        type=int,
-        default=2,
-        help="""number of times to retry when a possibly recoverable
-        error (e.g. download issue) occurs; default is 2, and 0 turns
-        off retries""",
-    )
-    add(
-        "--remove-manifest-on-success",
-        action="store_true",
+    add("--remove-manifest-on-success", action="store_true",
         help="""remove manifest file if all downloads are successful
         (only works in batch mode)""",
     )
-    add(
-        "--workdir",
-        type=pathlib.Path,
+    add("--workdir", type=Path,
         help="""working directory to store downloaded segments and other
         intermediate files (default is automatically determined based on
         URL and output file)""",
     )
-    add(
-        "--workroot",
+    add("--workroot",
         help="""if nonempty, this path is used as the root directory for
         all processing, under which both the working directory and final
         destination are mapped; after merging is done, the artifact is
@@ -574,51 +554,47 @@ def main() -> int:
         a slow HDD with workroot on a fast SSD; destination on a
         networked drive with workroot on a local drive)""",
     )
-    add(
-        "--wipe",
-        action="store_true",
+    add("--wipe", action="store_true",
         help="wipe all downloaded files (if any) and start over",
     )
-    add(
-        "-v",
-        "--verbose",
-        action="count",
+    add("--progress", action="store_true",
+        help="show download progress bar regardless of verbosity level",
+    )
+    add("--no-progress", action="store_true",
+        help="suppress download progress bar regardless of verbosity level",
+    )
+    add("--verbose", "-v", action="count",
         default=0,
         help="increase logging verbosity (can be specified multiple times)",
     )
-    add(
-        "--progress",
-        action="store_true",
-        help="show download progress bar regardless of verbosity level",
-    )
-    add(
-        "--no-progress",
-        action="store_true",
-        help="suppress download progress bar regardless of verbosity level",
-    )
-    add(
-        "-q",
-        "--quiet",
-        action="count",
+    add("--quiet", "-q", action="count",
         default=0,
         help="decrease logging verbosity (can be specified multiple times)",
     )
-    add(
-        "--debug",
-        action="store_true",
+    add("--ffmpeg-loglevel",
+        default="info",
+        help="set logging level for ffmpeg",
+    )
+    add("--debug", action="store_true",
         help="output debugging information (also implies highest verbosity)",
     )
     add("-V", "--version", action="version", version=__version__)
 
-    # First make sure arguments on the command line are valid.
-    args = parser.parse_args()
+    exclude_defaults = ('help', 'version')
+    global DEFAULT_ARGUMENTS
+    DEFAULT_ARGUMENTS = {
+        a.dest: a.default
+        for a in parser._actions
+        if a.dest not in exclude_defaults
+            and len(a.option_strings) > 0
+            or a.default is not None
+    }
 
-    if not USER_CONFIG_DISABLED:
-        # Prepend defaults from user config and parse again. If parsing
-        # fails this time, the error must be in the config file.
-        args = parser.parse_args_with_user_config(config_defaults=user_config_options)
+    return parser
 
-    increase_logging_verbosity(args.verbose - args.quiet)
+def __handle_arguments(args: argparse.Namespace) -> Any:
+    vrb = args.verbose - args.quiet
+    increase_logging_verbosity(vrb)
     if args.debug:
         increase_logging_verbosity(5)
 
@@ -631,7 +607,7 @@ def main() -> int:
             return 1
 
     if args.workroot:
-        args.workroot = pathlib.Path(args.workroot)
+        args.workroot = Path(args.workroot)
     else:
         args.workroot = None
     if args.workroot and not args.workroot.is_dir():
@@ -668,23 +644,74 @@ def main() -> int:
         concat_method=args.concat_method,
         retries=args.retries,
         progress=progress,
+        verbosity=vrb,
+        ffmpeg_loglevel=args.ffmpeg_loglevel,
+        progress_hooks=args.progress_hooks,
     )
+    return kwargs
+def __launch(args: argparse.Namespace) -> int:
+    ret = __handle_arguments(args)
+    if not isinstance(ret, dict):
+        return ret
 
     if shutil.which("ffmpeg") is None:
         logger.critical("ffmpeg not found")
         return 1
 
+    if not args.batch:
+        return process_entry(args.m3u8_url, args.output, **ret)
+    else:
+        manifest = Path(args.m3u8_url).resolve()
+        return process_batch(
+            manifest,
+            remove_manifest_on_success=args.remove_manifest_on_success,
+            debug=args.debug,
+            **ret,
+        )
+
+def invoke(**kwargs):
+    """Available arguments:
+    - output:      Path
+    - workdir:     Path
+    - workroot:    str
+    - batch:       bool
+    - exist_ok:    bool
+    - force:       bool
+    - keep:        bool
+    - wipe:        bool
+    - jobs:        int
+    - retries:     int
+    - verbose:     int
+    - quiet:       int
+    - debug:       bool
+    - progress:    bool
+    - no_progress: bool
+    - concat_method: ["concat_demuxer", "concat_protocol", "0", "1"]
+    - remove_manifest_on_success: bool
+    + ffmpeg_loglevel: int
+    + progress_hooks: [lambdas]
+    """
+    _ = make_arguments()
+    args = DEFAULT_ARGUMENTS.copy()
+    args.update(kwargs)
+    if __launch(argparse.Namespace(**args)) != 0:
+        raise RuntimeError()
+
+def main() -> int:
+    parser = make_arguments()
+
+    user_config_options = [] if USER_CONFIG_DISABLED else load_user_config()
+
+    # First make sure arguments on the command line are valid.
+    args = parser.parse_args()
+
+    if not USER_CONFIG_DISABLED:
+        # Prepend defaults from user config and parse again. If parsing
+        # fails this time, the error must be in the config file.
+        args = parser.parse_args_with_user_config(config_defaults=user_config_options)
+
     try:
-        if not args.batch:
-            return process_entry(args.m3u8_url, args.output, **kwargs)
-        else:
-            manifest = pathlib.Path(args.m3u8_url).resolve()
-            return process_batch(
-                manifest,
-                remove_manifest_on_success=args.remove_manifest_on_success,
-                debug=args.debug,
-                **kwargs,
-            )
+        return __launch(args)
     except KeyboardInterrupt:
         return 1
 
