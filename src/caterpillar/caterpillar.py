@@ -290,8 +290,7 @@ def process_entry(
     concat_method: str = "concat_demuxer",
     retries: int = 0,
     progress: bool = True,
-    verbosity: int = 0,
-    ffmpeg_loglevel: str = None,
+    ffmpeg_quiet: bool = False,
     progress_hooks: List[Callable] = None,
 ) -> int:
     if output is None:
@@ -384,7 +383,7 @@ def process_entry(
                 local_m3u8_file,
                 merge_dest,
                 concat_method=concat_method,
-                loglevel=ffmpeg_loglevel,
+                quiet=ffmpeg_quiet,
             )
 
             if output != merge_dest:
@@ -615,7 +614,7 @@ def make_arguments() -> ArgumentParser:
         help="decrease logging verbosity (can be specified multiple times)",
     )
     add(
-        "--ffmpeg-loglevel", default="info", help="set logging level for ffmpeg",
+        "--ffmpeg-quiet", action="store_true", help="suppress ffmpeg output entirely",
     )
     add(
         "--debug",
@@ -689,8 +688,7 @@ def __handle_arguments(args: argparse.Namespace) -> Any:
         concat_method=args.concat_method,
         retries=args.retries,
         progress=progress,
-        verbosity=vrb,
-        ffmpeg_loglevel=args.ffmpeg_loglevel,
+        ffmpeg_quiet=args.ffmpeg_quiet,
         progress_hooks=args.progress_hooks,
     )
     return kwargs
@@ -736,7 +734,7 @@ def invoke(**kwargs):
     - no_progress: bool
     - concat_method: ["concat_demuxer", "concat_protocol", "0", "1"]
     - remove_manifest_on_success: bool
-    + ffmpeg_loglevel: int
+    + ffmpeg_quiet: bool
     + progress_hooks: [lambdas]
     """
     _ = make_arguments()

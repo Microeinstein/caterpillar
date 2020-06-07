@@ -32,7 +32,7 @@ def attempt_merge(
     m3u8_file: pathlib.Path,
     output: pathlib.Path,
     ignore_errors: bool = False,
-    loglevel: str = "info",
+    quiet: bool = False,
 ) -> Optional[str]:
     logger.info(f"attempting to merge {m3u8_file} into {output}")
 
@@ -40,7 +40,7 @@ def attempt_merge(
     if len(m3u8_obj.segments) == 1:
         # Only one segment, cannot further subdivide, so ignore whatever
         # problems there may be.
-        logger.info(f"only one segment in playlist; ignoring errors and warnings")
+        logger.info("only one segment in playlist; ignoring errors and warnings")
         ignore_errors = True
 
     regular_pattern = re.compile(r"Opening '(?P<path>.*\.ts)' for reading")
@@ -51,7 +51,7 @@ def attempt_merge(
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
-        loglevel,
+        "info",
         "-f",
         "hls",
         "-i",
@@ -77,7 +77,7 @@ def attempt_merge(
         m = regular_pattern.search(line)
         # Suppress the line if logging level is below INFO and it's just
         # a boring "Opening '...' for reading" message.
-        if not m or should_log_info():
+        if not quiet and not m and should_log_info():
             sys.stderr.write(line)
             sys.stderr.flush()
         if m:
@@ -171,7 +171,7 @@ def incremental_merge(
     m3u8_file: pathlib.Path,
     output: pathlib.Path,
     concat_method: str = "concat_demuxer",
-    loglevel: str = "info",
+    quiet: bool = False,
 ):
     # Resolve output so that we don't write to a different relative path
     # later when we run FFmpeg from a different pwd.
@@ -186,13 +186,13 @@ def incremental_merge(
 
     while True:
         merge_dest = intermediate_dir / f"{playlist_index}.mp4"
-        split_point = attempt_merge(playlist, merge_dest, loglevel=loglevel)
+        split_point = attempt_merge(playlist, merge_dest, quiet=quiet)
         if not split_point:
             break
         playlist_index += 1
         next_playlist = directory / f"{playlist_index}.m3u8"
         split_m3u8(playlist, (playlist, next_playlist), split_point)
-        attempt_merge(playlist, merge_dest, ignore_errors=True, verbosity=verbosity)
+        attempt_merge(playlist, merge_dest, ignore_errors=True, quiet=quiet)
         playlist = next_playlist
 
     with chdir(intermediate_dir):
@@ -205,7 +205,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                loglevel,
+                "info",
                 "-f",
                 "concat",
                 "-i",
@@ -227,7 +227,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                loglevel,
+                "info",
                 "-i",
                 ffmpeg_input,
                 "-c",
@@ -244,7 +244,15 @@ def incremental_merge(
 
         try:
             logger.info("merging intermediate products...")
-            subprocess.run(command, stdin=subprocess.DEVNULL, check=True)
+            ffmeg_output = subprocess.STDOUT if not quiet else subprocess.DEVNULL
+            ffmeg_err = subprocess.STDERR if not quiet else subprocess.DEVNULL
+            subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=ffmeg_output,
+                stderr=ffmeg_err,
+                check=True,
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f"ffmpeg failed with exit status {e.returncode}")
             raise RuntimeError("unknown error occurred during merging")
