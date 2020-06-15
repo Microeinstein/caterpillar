@@ -9,7 +9,15 @@ from typing import Optional, Tuple
 
 import m3u8
 
-from .utils import abspath, chdir, generate_m3u8, logger, should_log_info
+from .utils import (
+    FFmpegLogLevel,
+    abspath,
+    chdir,
+    ffmpeg_loglevel,
+    ffmpeg_log_entry_get_loglevel,
+    generate_m3u8,
+    logger,
+)
 
 
 # If ignore_errors is True, blast through non-monotonous DTS errors
@@ -29,10 +37,7 @@ from .utils import abspath, chdir, generate_m3u8, logger, should_log_info
 # Returns None if the merge succeeds, or the basename of the first bad
 # segment if non-monotonous DTS is detected.
 def attempt_merge(
-    m3u8_file: pathlib.Path,
-    output: pathlib.Path,
-    ignore_errors: bool = False,
-    quiet: bool = False,
+    m3u8_file: pathlib.Path, output: pathlib.Path, ignore_errors: bool = False
 ) -> Optional[str]:
     logger.info(f"attempting to merge {m3u8_file} into {output}")
 
@@ -47,11 +52,13 @@ def attempt_merge(
     error_pattern = re.compile(
         r"(Non-monotonous DTS in output stream|out of range for mov/mp4 format)"
     )
+    user_loglevel = ffmpeg_loglevel()
+    invocation_loglevel = ffmpeg_loglevel(minimum=FFmpegLogLevel.info)
     command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
-        "info",
+        f"level+{invocation_loglevel}",
         "-f",
         "hls",
         "-i",
@@ -63,6 +70,7 @@ def attempt_merge(
         "-y",
         str(output),
     ]
+    logger.info(" ".join(command))
     p = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
@@ -72,14 +80,14 @@ def attempt_merge(
         encoding="utf-8",
         errors="backslashreplace",
     )
+    assert p.stderr is not None
     last_read_segment = None
     for line in p.stderr:
-        m = regular_pattern.search(line)
-        # Suppress the line if logging level is below INFO and it's just
-        # a boring "Opening '...' for reading" message.
-        if not quiet and not m and should_log_info():
+        entry_loglevel = ffmpeg_log_entry_get_loglevel(line)
+        if entry_loglevel is None or entry_loglevel <= user_loglevel:
             sys.stderr.write(line)
             sys.stderr.flush()
+        m = regular_pattern.search(line)
         if m:
             last_read_segment = os.path.basename(m["path"])
             continue
@@ -168,10 +176,7 @@ def split_m3u8(
 # [1] https://ffmpeg.org/ffmpeg-all.html#concat-1
 # [2] https://ffmpeg.org/ffmpeg-all.html#concat-2
 def incremental_merge(
-    m3u8_file: pathlib.Path,
-    output: pathlib.Path,
-    concat_method: str = "concat_demuxer",
-    quiet: bool = False,
+    m3u8_file: pathlib.Path, output: pathlib.Path, concat_method: str = "concat_demuxer"
 ):
     # Resolve output so that we don't write to a different relative path
     # later when we run FFmpeg from a different pwd.
@@ -186,16 +191,17 @@ def incremental_merge(
 
     while True:
         merge_dest = intermediate_dir / f"{playlist_index}.mp4"
-        split_point = attempt_merge(playlist, merge_dest, quiet=quiet)
+        split_point = attempt_merge(playlist, merge_dest)
         if not split_point:
             break
         playlist_index += 1
         next_playlist = directory / f"{playlist_index}.m3u8"
         split_m3u8(playlist, (playlist, next_playlist), split_point)
-        attempt_merge(playlist, merge_dest, ignore_errors=True, quiet=quiet)
+        attempt_merge(playlist, merge_dest, ignore_errors=True)
         playlist = next_playlist
 
     with chdir(intermediate_dir):
+        loglevel = ffmpeg_loglevel()
         if concat_method == "concat_demuxer":
             with open("concat.txt", "w", encoding="utf-8") as fp:
                 for index in range(1, playlist_index + 1):
@@ -205,7 +211,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                "info",
+                f"level+{loglevel}",
                 "-f",
                 "concat",
                 "-i",
@@ -227,7 +233,7 @@ def incremental_merge(
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
-                "info",
+                f"level+{loglevel}",
                 "-i",
                 ffmpeg_input,
                 "-c",
@@ -244,15 +250,8 @@ def incremental_merge(
 
         try:
             logger.info("merging intermediate products...")
-            ffmeg_output = subprocess.STDOUT if not quiet else subprocess.DEVNULL
-            ffmeg_err = subprocess.STDERR if not quiet else subprocess.DEVNULL
-            subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=ffmeg_output,
-                stderr=ffmeg_err,
-                check=True,
-            )
+            logger.info(" ".join(command))
+            subprocess.run(command, stdin=subprocess.DEVNULL, check=True)
         except subprocess.CalledProcessError as e:
             logger.error(f"ffmpeg failed with exit status {e.returncode}")
             raise RuntimeError("unknown error occurred during merging")

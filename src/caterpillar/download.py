@@ -5,13 +5,20 @@ import signal
 import time
 import urllib.parse
 from pathlib import Path
-from math import ceil
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, Sequence, Tuple
 
 import click
 import m3u8
 import requests
 
+from .events import (
+    EventHook,
+    SegmentsDownloadInitiatedEvent,
+    SegmentsDownloadFinishedEvent,
+    SegmentDownloadSucceededEvent,
+    SegmentDownloadFailedEvent,
+    emit_event,
+)
 from .utils import (
     generate_m3u8,
     logger,
@@ -26,26 +33,6 @@ MAX_RETRY_INTERVAL = 30  # Upper bound on exponential backoff
 
 # For proper progress bar rendering on Windows consoles.
 monkeypatch_get_terminal_size()
-
-
-# Similar behavior to https://github.com/ytdl-org/youtube-dl/blob/3e4cedf9e8cd3157df2457df7274d0c842421945/youtube_dl/YoutubeDL.py#L230
-__PROGRESS_STATUS_DEFAULTS = {
-    k: None
-    for k in """
-    status   downloaded_bytes   total_bytes total_bytes_estimate
-    fragment_index fragment_count
-""".split()
-}  # filename tmpfilename elapsed eta speed
-__STATUS_DOWNLOADING = "downloading"
-__STATUS_ERROR = "error"
-__STATUS_FINISHED = "finished"
-
-
-def call_progress_hooks(progress_hooks: List[Callable], **kwargs):
-    status = __PROGRESS_STATUS_DEFAULTS.copy()
-    status.update(kwargs)
-    for f in progress_hooks or []:
-        f(status)
 
 
 # Get mtime from an HTTP response's Last-Modified header, or Date
@@ -68,9 +55,7 @@ def get_mtime(r: requests.Response) -> Optional[int]:
 #
 # If server_timestamp is True, set mtime of the downloaded file
 # according to timestamp reported by server.
-def resumable_download(
-    url: str, file: Path, server_timestamp: bool = False
-) -> Tuple[bool, int]:
+def resumable_download(url: str, file: Path, server_timestamp: bool = False) -> bool:
     headers = dict()
     existing_bytes = file.stat().st_size if file.is_file() else 0
     if existing_bytes:
@@ -80,7 +65,7 @@ def resumable_download(
         r = requests.get(url, headers=headers, stream=True, timeout=REQUESTS_TIMEOUT)
         if r.status_code not in {200, 206}:
             logger.error(f"GET {url}: HTTP {r.status_code}")
-            return False, 0
+            return False
         with open(file, "ab") as fp:
             for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                 if chunk:
@@ -94,39 +79,35 @@ def resumable_download(
                     os.utime(file, times=(atime, mtime))
                 except OSError:
                     logger.warning(f"GET {url}: failed to set mtime on {file}")
-        return True, file.stat().st_size
+        return True
     except Exception:
         logger.exc_warning(f"GET {url}")
-        return False, 0
+        return False
 
 
-# Returns a bool indicating success (True) or failure (False),
-# plus the size of the file.
+# Returns a bool indicating success (True) or failure (False).
 #
 # If server_timestamp is True, set mtime of the downloaded file
 # according to timestamp reported by server.
 def resumable_download_with_retries(
     url: str, file: Path, max_retries: int = 2, server_timestamp: bool = False
-) -> Tuple[bool, int]:
+) -> bool:
     incomplete_file = file.with_suffix(file.suffix + ".part")
 
     # If the file, without the .part suffix, is already present,
     # assume it has been downloaded.
     if file.exists():
-        return True, file.stat().st_size
+        return True
 
     retries = 0
     while True:
-        success, size = resumable_download(
-            url, incomplete_file, server_timestamp=server_timestamp
-        )
-        if success:
+        if resumable_download(url, incomplete_file, server_timestamp=server_timestamp):
             os.replace(incomplete_file, file)
-            return True, size
+            return True
 
         if retries >= max_retries:
             logger.error(f"GET {url}: failed after {max_retries} retries")
-            return False, 0
+            return False
 
         retries += 1
         wait_time = min(2 ** retries, MAX_RETRY_INTERVAL)
@@ -137,18 +118,18 @@ def resumable_download_with_retries(
 # Returns a bool indicating success (True) or failure (False).
 def download_m3u8_file(m3u8_url: str, file: Path) -> bool:
     logger.info(f"downloading {m3u8_url} to {file} ...")
-    success, _ = resumable_download_with_retries(m3u8_url, file, server_timestamp=True)
-    return success
+    return resumable_download_with_retries(m3u8_url, file, server_timestamp=True)
 
 
-# Returns a bool indicating success (True) or failure (False),
-# plus the size of the file.
+# Returns the path to the downloaded segment on success, otherwise None.
 def download_segment(
     url: str, index: int, directory: Path, max_retries: int = 2
-) -> Tuple[bool, int]:
-    return resumable_download_with_retries(
-        url, directory / f"{index}.ts", max_retries=max_retries
-    )
+) -> Optional[Path]:
+    file = directory / f"{index}.ts"
+    if resumable_download_with_retries(url, file, max_retries=max_retries):
+        return file
+    else:
+        return None
 
 
 # download_segment wrapper that takes all arguments as a single tuple
@@ -157,51 +138,25 @@ def download_segment(
 # the worker processes do not actually inherit logger level), so that we
 # can use it with multiprocessing.pool.Pool.map and company. It also
 # gracefully consumes KeyboardInterrupt.
-def _download_segment_mappable(args: Tuple[str, int, Path, int]) -> Tuple[bool, int]:
+#
+# Returns (url, index, downloaded_path), where downloaded_path is None
+# if download failed.
+def _download_segment_mappable(
+    args: Tuple[str, int, Path, int]
+) -> Tuple[str, int, Optional[Path]]:
+    url, index, directory, logging_level = args
     try:
-        url, index, directory, logging_level = args
         logger.setLevel(logging_level)
-        return download_segment(url, index, directory)
+        return url, index, download_segment(url, index, directory)
     except KeyboardInterrupt:
-        url, *_ = args
         logger.debug(f"download of {url} has been interrupted")
-        return False, 0
+        return url, index, None
 
 
 def _raise_keyboard_interrupt(signum, _):
     pid = os.getpid()
     logger.debug(f"pid {pid} received signal {signum}; transforming into SIGINT")
     raise KeyboardInterrupt
-
-
-# def get_downloaded_bytes(folder: Path):
-#    return sum(f.stat().st_size for f in folder.glob('**/*') if f.is_file())
-
-
-def download_m3u8_playlist_or_variant(
-    m3u8_url: str, remote0_m3u8_file: Path, remote1_m3u8_file: Path = None,
-) -> Tuple[bool, str, str]:
-    if not download_m3u8_file(m3u8_url, remote0_m3u8_file):
-        # Return without retries because we already retried a
-        # couple of times in download_m3u8_file.
-        logger.critical(f"failed to download {m3u8_url}")
-        return False, None, None
-    logger.info(f"downloaded {remote0_m3u8_file}")
-
-    if remote1_m3u8_file is None:
-        return True, m3u8_url, remote0_m3u8_file
-
-    try:
-        m3u8_obj = m3u8.load(str(remote0_m3u8_file))
-        if m3u8_obj.is_variant:
-            uri = m3u8_obj.playlists[0].uri
-            url = urllib.parse.urljoin(m3u8_url, uri)
-            return download_m3u8_playlist_or_variant(
-                url, remote0_m3u8_file=remote1_m3u8_file
-            )
-    except Exception:
-        logger.exc_error(f"failed to parse {remote0_m3u8_file}")
-        return False, None, None
 
 
 # Download all segments in remote_m3u8_file (downloaded from
@@ -220,10 +175,13 @@ def download_m3u8_segments(
     *,
     jobs: int = None,
     progress: bool = None,
-    progress_hooks: List[Callable] = None,
+    event_hooks: Sequence[EventHook] = None,
 ) -> bool:
     if jobs is None:
         jobs = (os.cpu_count() or 4) * 2
+
+    if event_hooks is None:
+        event_hooks = []
 
     try:
         remote_m3u8_obj = m3u8.load(str(remote_m3u8_file))
@@ -234,11 +192,10 @@ def download_m3u8_segments(
     target_duration = remote_m3u8_obj.target_duration
     local_segments = []
     download_args = []
-    working_directory = local_m3u8_file.parent
     logging_level = logger.getEffectiveLevel()
     for index, segment in enumerate(remote_m3u8_obj.segments):
         url = urllib.parse.urljoin(remote_m3u8_url, segment.uri)
-        download_args.append((url, index, working_directory, logging_level))
+        download_args.append((url, index, local_m3u8_file.parent, logging_level))
         local_segments.append((f"{index}.ts", segment.duration))
 
     with open(local_m3u8_file, "w", encoding="utf-8") as fp:
@@ -251,6 +208,7 @@ def download_m3u8_segments(
         return False
     jobs = min(jobs, total)
     with multiprocessing.Pool(jobs) as pool:
+        emit_event(SegmentsDownloadInitiatedEvent(segment_count=total), event_hooks)
         # For the duration of the worker pool, map SIGTERM to SIGINT on
         # the main process. We only do this after the fork, and restore
         # the original SIGTERM handler (usually SIG_DFL) at the end of
@@ -260,7 +218,6 @@ def download_m3u8_segments(
         try:
             num_success = 0
             num_failure = 0
-            num_handled = 0
             logger.info(f"downloading {total} segments with {jobs} workers...")
             progress_bar_generator = (
                 click.progressbar if progress else stub_context_manager
@@ -271,36 +228,31 @@ def download_m3u8_segments(
                 show_pos=True,
                 length=total,
             )
-            downloaded = 0
             with progress_bar_generator(**progress_bar_props) as bar:  # type: ignore
-                for success, size in pool.imap_unordered(
+                for segment_url, _, downloaded_path in pool.imap_unordered(
                     _download_segment_mappable, download_args
                 ):
-                    num_handled += 1
-                    if success:
+                    if downloaded_path:
                         num_success += 1
+                        emit_event(
+                            SegmentDownloadSucceededEvent(path=downloaded_path),
+                            event_hooks,
+                        )
                     else:
                         num_failure += 1
-                    downloaded += size  # get_downloaded_bytes(working_directory)
-                    call_progress_hooks(
-                        progress_hooks,
-                        status=__STATUS_DOWNLOADING,
-                        fragment_index=num_handled,
-                        fragment_count=total,
-                        downloaded_bytes=downloaded,
-                        total_bytes_estimate=ceil(downloaded / num_handled * total),
-                    )
+                        emit_event(
+                            SegmentDownloadFailedEvent(segment_url=segment_url),
+                            event_hooks,
+                        )
                     logger.debug(f"progress: {num_success}/{num_failure}/{total}")
                     bar.update(1)
-            call_progress_hooks(
-                progress_hooks,
-                status=__STATUS_FINISHED,
-                fragment_index=num_handled,
-                fragment_count=total,
-                downloaded_bytes=downloaded,
-                total_bytes=downloaded,
-            )
 
+            emit_event(
+                SegmentsDownloadFinishedEvent(
+                    success_count=num_success, failure_count=num_failure
+                ),
+                event_hooks,
+            )
             if num_failure > 0:
                 logger.error(f"failed to download {num_failure} segments")
                 return False

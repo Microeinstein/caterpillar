@@ -8,11 +8,13 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Callable
+from typing import Any, List, Optional, Sequence, Tuple
 
+import m3u8
 import peewee
 
-from . import download, merge, persistence
+from . import download, merge, persistence, variants
+from .events import EventHook, MergeFinishedEvent, emit_event
 from .utils import (
     USER_CONFIG_DIR,
     USER_CONFIG_DISABLED,
@@ -276,6 +278,53 @@ def move_to_backup(path: Path) -> Optional[Path]:
         return None
 
 
+# Download m3u8_url to the designated path. If there are variant streams
+# in the m3u8 file, select a variant, resolve the URL, and download to
+# the designated path with variant_suffix appended to the stem of the
+# filename. Repeat this process until there are no longer variant streams.
+#
+# Returns the final resolved url and file path. Returned file path is
+# None if there's an error along the way.
+#
+# Naming example:
+#   remote.m3u8 => remote.variant.m3u8 => remote.variant.variant.m3u8 => ...
+def download_m3u8_file_and_resolve_variants(
+    m3u8_url: str, m3u8_file: Path, *, variant_suffix=".variant"
+) -> Tuple[str, Optional[Path]]:
+    while True:
+        if not download.download_m3u8_file(m3u8_url, m3u8_file):
+            logger.error(f"failed to download {m3u8_url}")
+            return m3u8_url, None
+
+        try:
+            m3u8_obj = m3u8.load(str(m3u8_file))
+        except Exception:
+            logger.exc_error(f"failed to parse {m3u8_file}")
+            return m3u8_url, None
+
+        if not m3u8_obj.is_variant:
+            return m3u8_url, m3u8_file
+
+        variant_count = len(m3u8_obj.playlists)
+        if variant_count == 0:
+            # This branch shouldn't be reachable.
+            logger.error(f"found 0 variant streams in {m3u8_file}")
+            return m3u8_url, None
+
+        selected_variant = variants.select_variant(m3u8_obj)
+        if variant_count == 1:
+            logger.info(f"found 1 variant stream in {m3u8_file}")
+        else:
+            selected_variant_spec = str(selected_variant).replace("\n", " ")
+            logger.warning(
+                f"found {variant_count} variant streams in {m3u8_file}; "
+                f"selected variant {selected_variant_spec}"
+            )
+        m3u8_url = urllib.parse.urljoin(m3u8_url, selected_variant.uri)
+        logger.info(f"resolved to {m3u8_url}")
+        m3u8_file = m3u8_file.with_suffix(variant_suffix + m3u8_file.suffix)
+
+
 def process_entry(
     m3u8_url: str,
     output: Path,
@@ -290,9 +339,11 @@ def process_entry(
     concat_method: str = "concat_demuxer",
     retries: int = 0,
     progress: bool = True,
-    ffmpeg_quiet: bool = False,
-    progress_hooks: List[Callable] = None,
+    event_hooks: Sequence[EventHook] = None,
 ) -> int:
+    if event_hooks is None:
+        event_hooks = []
+
     if output is None:
         stem = Path(urllib.parse.urlsplit(m3u8_url).path).stem
         if not stem or stem.startswith("."):
@@ -348,48 +399,46 @@ def process_entry(
         logger.critical(f'"{output}" is not a valid path or is not writable')
         return 1
 
+    remote_m3u8_url = m3u8_url
     working_directory = prepare_working_directory(
-        m3u8_url, output, workroot=workroot, user_specified_workdir=workdir, wipe=wipe,
+        remote_m3u8_url,
+        output,
+        workroot=workroot,
+        user_specified_workdir=workdir,
+        wipe=wipe,
     )
     if not working_directory:
         logger.critical("failed to prepare working directory")
         return 1
-    remote0_m3u8_file = working_directory / "remote0.m3u8"
-    remote1_m3u8_file = working_directory / "remote1.m3u8"
+    remote_m3u8_file = working_directory / "remote.m3u8"
     local_m3u8_file = working_directory / "local.m3u8"
     for ntry in range(max(retries, 0) + 1):
         try:
-            (
-                success,
-                m3u8_url,
-                remote_m3u8_file,
-            ) = download.download_m3u8_playlist_or_variant(
-                m3u8_url, remote0_m3u8_file, remote1_m3u8_file
+            remote_m3u8_url, remote_m3u8_file = download_m3u8_file_and_resolve_variants(
+                remote_m3u8_url, remote_m3u8_file
             )
-            if not success:
+            if not remote_m3u8_file:
+                # Return without retries because we already retried a
+                # couple of times in download_m3u8_file.
+                logger.critical(f"failed to download and resolve {remote_m3u8_url}")
                 return 1
-
+            logger.info(f"downloaded {remote_m3u8_file}")
             if not download.download_m3u8_segments(
-                m3u8_url,
+                remote_m3u8_url,
                 remote_m3u8_file,
                 local_m3u8_file,
                 jobs=jobs,
                 progress=progress,
-                progress_hooks=progress_hooks,
+                event_hooks=event_hooks,
             ):
                 raise RuntimeError("failed to download some segments")
-
             merge.incremental_merge(
-                local_m3u8_file,
-                merge_dest,
-                concat_method=concat_method,
-                quiet=ffmpeg_quiet,
+                local_m3u8_file, merge_dest, concat_method=concat_method
             )
-
             if output != merge_dest:
                 try:
                     logger.info(f'moving "{merge_dest}" to "{output}"...')
-                    shutil.move(merge_dest, output)
+                    shutil.move(str(merge_dest), output)
                 except OSError:
                     # This is unlikely a quickly retriable issue, so we
                     # return an error immediately.
@@ -412,9 +461,11 @@ def process_entry(
             except OSError:
                 logger.warning(f"failed to set mtime on {output}")
 
+            emit_event(MergeFinishedEvent(path=output), event_hooks)
+
             if not keep:
                 try:
-                    persistence.drop(m3u8_url)
+                    persistence.drop(remote_m3u8_url)
                 except peewee.PeeweeException:
                     logger.exc_error("exception when updating cache")
                 shutil.rmtree(working_directory)
@@ -495,10 +546,9 @@ def process_batch(
     return retval
 
 
-DEFAULT_ARGUMENTS: Dict = None
+def main() -> int:
+    user_config_options = [] if USER_CONFIG_DISABLED else load_user_config()
 
-
-def make_arguments() -> ArgumentParser:
     parser = ArgumentParser()
     add = parser.add_argument
 
@@ -614,31 +664,21 @@ def make_arguments() -> ArgumentParser:
         help="decrease logging verbosity (can be specified multiple times)",
     )
     add(
-        "--ffmpeg-quiet", action="store_true", help="suppress ffmpeg output entirely",
-    )
-    add(
         "--debug",
         action="store_true",
         help="output debugging information (also implies highest verbosity)",
     )
     add("-V", "--version", action="version", version=__version__)
 
-    exclude_defaults = ("help", "version")
-    global DEFAULT_ARGUMENTS
-    DEFAULT_ARGUMENTS = {
-        a.dest: a.default
-        for a in parser._actions
-        if a.dest not in exclude_defaults
-        and len(a.option_strings) > 0
-        or a.default is not None
-    }
+    # First make sure arguments on the command line are valid.
+    args = parser.parse_args()
 
-    return parser
+    if not USER_CONFIG_DISABLED:
+        # Prepend defaults from user config and parse again. If parsing
+        # fails this time, the error must be in the config file.
+        args = parser.parse_args_with_user_config(config_defaults=user_config_options)
 
-
-def __handle_arguments(args: argparse.Namespace) -> Any:
-    vrb = args.verbose - args.quiet
-    increase_logging_verbosity(vrb)
+    increase_logging_verbosity(args.verbose - args.quiet)
     if args.debug:
         increase_logging_verbosity(5)
 
@@ -688,77 +728,23 @@ def __handle_arguments(args: argparse.Namespace) -> Any:
         concat_method=args.concat_method,
         retries=args.retries,
         progress=progress,
-        ffmpeg_quiet=args.ffmpeg_quiet,
-        progress_hooks=args.progress_hooks,
     )
-    return kwargs
-
-
-def __launch(args: argparse.Namespace) -> int:
-    ret = __handle_arguments(args)
-    if not isinstance(ret, dict):
-        return ret
 
     if shutil.which("ffmpeg") is None:
         logger.critical("ffmpeg not found")
         return 1
 
-    if not args.batch:
-        return process_entry(args.m3u8_url, args.output, **ret)
-    else:
-        manifest = Path(args.m3u8_url).resolve()
-        return process_batch(
-            manifest,
-            remove_manifest_on_success=args.remove_manifest_on_success,
-            debug=args.debug,
-            **ret,
-        )
-
-
-def invoke(**kwargs):
-    """Available arguments:
-    - output:      Path
-    - workdir:     Path
-    - workroot:    str
-    - batch:       bool
-    - exist_ok:    bool
-    - force:       bool
-    - keep:        bool
-    - wipe:        bool
-    - jobs:        int
-    - retries:     int
-    - verbose:     int
-    - quiet:       int
-    - debug:       bool
-    - progress:    bool
-    - no_progress: bool
-    - concat_method: ["concat_demuxer", "concat_protocol", "0", "1"]
-    - remove_manifest_on_success: bool
-    + ffmpeg_quiet: bool
-    + progress_hooks: [lambdas]
-    """
-    _ = make_arguments()
-    args = DEFAULT_ARGUMENTS.copy()
-    args.update(kwargs)
-    if __launch(argparse.Namespace(**args)) != 0:
-        raise RuntimeError()
-
-
-def main() -> int:
-    parser = make_arguments()
-
-    user_config_options = [] if USER_CONFIG_DISABLED else load_user_config()
-
-    # First make sure arguments on the command line are valid.
-    args = parser.parse_args()
-
-    if not USER_CONFIG_DISABLED:
-        # Prepend defaults from user config and parse again. If parsing
-        # fails this time, the error must be in the config file.
-        args = parser.parse_args_with_user_config(config_defaults=user_config_options)
-
     try:
-        return __launch(args)
+        if not args.batch:
+            return process_entry(args.m3u8_url, args.output, **kwargs)
+        else:
+            manifest = Path(args.m3u8_url).resolve()
+            return process_batch(
+                manifest,
+                remove_manifest_on_success=args.remove_manifest_on_success,
+                debug=args.debug,
+                **kwargs,
+            )
     except KeyboardInterrupt:
         return 1
 

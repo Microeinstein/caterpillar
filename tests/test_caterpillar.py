@@ -1,12 +1,25 @@
 import os
+import re
+import pathlib
+import subprocess
 import sys
 
 import pytest
 
 from caterpillar import caterpillar
+from caterpillar.events import EventType
 
 
 pytestmark = pytest.mark.usefixtures("chtmpdir")
+
+
+# Returns ffprobe output for the specified media file.
+def probe(file):
+    return subprocess.check_output(
+        ["ffprobe", "-hide_banner", file],
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+    )
 
 
 class TestCaterpillar(object):
@@ -61,7 +74,35 @@ class TestCaterpillar(object):
         assert os.path.isdir("empty")
         assert not os.path.isfile("empty.mp4")
 
-    def test_containers(self, hls_server, monkeypatch):
-        monkeypatch.setattr(sys, "argv", ["-", hls_server.good_playlist, "good.flv"])
+    def test_variant_streams(self, hls_server, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv", ["-", hls_server.variants_playlist, "variant.mp4"]
+        )
         assert caterpillar.main() == 0
-        assert os.path.isfile("good.flv")
+        assert os.path.isfile("variant.mp4")
+        # Make sure the 720p variant is the one downloaded, not the 480p one.
+        assert re.search(r"Video:.*1280x720", probe("variant.mp4"))
+
+    def test_event_hooks(self, hls_server):
+        seen_event_types = set()
+
+        def event_hook(event):
+            seen_event_types.add(event.event_type)
+
+        assert (
+            caterpillar.process_entry(
+                hls_server.good_playlist,
+                pathlib.Path("good.mp4"),
+                event_hooks=[event_hook],
+            )
+            == 0
+        )
+        assert os.path.isfile("good.mp4")
+        assert seen_event_types >= set(
+            [
+                EventType.SEGMENTS_DOWNLOAD_INITIATED,
+                EventType.SEGMENT_DOWNLOAD_SUCCEEDED,
+                EventType.SEGMENTS_DOWNLOAD_FINISHED,
+                EventType.MERGE_FINISHED,
+            ]
+        )
