@@ -259,11 +259,11 @@ def download_m3u8_segments(
             else:
                 logger.info(f"finished downloading all {total} segments")
                 return True
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as kbie:
             pool.terminate()
             pool.join()
             logger.critical("interrupted")
             # Bubble KeyboardInterrupt to stop retries.
-            raise KeyboardInterrupt
+            raise kbie from None
         finally:
             signal.signal(signal.SIGTERM, old_sigterm_handler)

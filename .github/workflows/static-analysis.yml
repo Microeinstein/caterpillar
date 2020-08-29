@@ -3,7 +3,6 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '0 0 * * 6'
 jobs:
   static-analysis:
     runs-on: ubuntu-latest
